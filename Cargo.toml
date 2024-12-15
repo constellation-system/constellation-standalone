@@ -20,7 +20,7 @@
 name = "constellation-standalone"
 description = "Standalone executable support for the Constellation distributed systems platform"
 version = "0.0.0"
-rust-version = "1.82"
+rust-version = "1.81"
 license = "AGPL-3.0-only"
 keywords = []
 categories = []

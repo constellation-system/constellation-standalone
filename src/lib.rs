@@ -155,7 +155,9 @@ pub trait Standalone: Sized {
 
         // Home configuration directory first.
         if let Ok(path) = std::env::var("HOME") {
-            let mut pathbuf = PathBuf::with_capacity(path.len() + 34);
+            let mut pathbuf = PathBuf::with_capacity(
+                path.len() + Self::HOME_CONFIG_SUBDIR.len()
+            );
 
             pathbuf.push(path);
             pathbuf.push(Self::HOME_CONFIG_SUBDIR);
@@ -168,6 +170,7 @@ pub trait Standalone: Sized {
             out.push(pathbuf);
         }
 
+        // Compute component-specific configuration variable name.
         let component_env_name = format!(
             "CONSTELLATION_{}_CONF_DIR",
             Self::COMPONENT_NAME.to_uppercase()
@@ -179,7 +182,7 @@ pub trait Standalone: Sized {
 
         // Check for configuration directory overrides.
         if let Ok(path) = std::env::var(component_env_name) {
-            // Consensus-specific configuration directory.
+            // Component-specific configuration directory.
             debug!(target: "standalone",
                    "adding configuration directory {}",
                    path);
@@ -341,7 +344,7 @@ pub trait Standalone: Sized {
                 Ok((app, create_cleanup)) => {
                     // Register signal handlers.
 
-                    // XXX handle error codes here.
+                    // ISSUE #5: handle error codes here.
                     let _ = unsafe { signal(SIGTERM, handler as sighandler_t) };
                     let _ = unsafe { signal(SIGINT, handler as sighandler_t) };
                     let _ = unsafe { signal(SIGHUP, handler as sighandler_t) };
@@ -352,6 +355,8 @@ pub trait Standalone: Sized {
                             // terminating signal.
                             match Mutex::new(()).lock() {
                                 Ok(guard) => {
+                                    // ISSUE #3: this is vulnerable to
+                                    // spurious wakeups
                                     if SHUTDOWN_COND.wait(guard).is_err() {
                                         error!(target: "standalone",
                                                "bad condition variable")
@@ -404,6 +409,7 @@ unsafe extern "C" fn handler(sig: c_int) {
         }
     }
 
+    // ISSUE #3: this can lose notifications.
     SHUTDOWN_COND.notify_all()
 }
 
