@@ -59,8 +59,7 @@ use serde::Deserialize;
 /// called directly from the top-level `main`.  It also manages the
 /// following tasks:
 ///
-/// * Identifying the location of configuration files, and reading
-///   them in.
+/// * Identifying the location of configuration files, and reading them in.
 ///
 /// * Setting up logging.
 ///
