@@ -102,9 +102,9 @@ pub trait Standalone: Sized {
     ///
     /// These are given in order of preference.
     ///
-    /// Defaults to a single entry, `constellation-log.yaml`.
+    /// Defaults to a single entry, `constellation-log.conf`.
     const LOG_CONFIG_FILES: &'static [&'static str] =
-        &["constellation-log.yaml"];
+        &["constellation-log.conf"];
 
     /// Type of configuration objects.
     type Config: for<'de> Deserialize<'de>;

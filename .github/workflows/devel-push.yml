@@ -347,9 +347,6 @@ jobs:
         with:
           apt: libkrb5-dev
 
-      - name: Generate test certificates
-        run: sh gen_test_certs.sh
-
       - name: Run tests
         if: matrix.os == 'ubuntu-24.04'
         uses: actions-rs/cargo@v1
