@@ -19,8 +19,9 @@
 [package]
 name = "constellation-standalone"
 description = "Standalone executable support for the Constellation distributed systems platform"
+repository = "https://github.com/constellation-system/constellation-standalone"
 version = "0.0.0"
-rust-version = "1.82"
+rust-version = "1.81"
 license = "AGPL-3.0-only"
 keywords = []
 categories = []
@@ -28,3 +29,14 @@ exclude = [
     ".gitignore"
 ]
 edition = "2018"
+
+[features]
+default = ["log"]
+log = ["dep:log", "dep:log4rs"]
+
+[dependencies]
+libc = { version = "0.2" }
+log = { version = "0.4", optional = true }
+log4rs = { version = "1.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = { version = "0.9" }
