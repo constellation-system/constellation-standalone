@@ -35,6 +35,7 @@ default = ["log"]
 log = ["dep:log", "dep:log4rs"]
 
 [dependencies]
+constellation-common = { git = "https://github.com/constellation-system/constellation-common.git", branch = "projects/tech-debt", default-features = false }
 libc = { version = "0.2" }
 log = { version = "0.4", optional = true }
 log4rs = { version = "1.2", optional = true }
