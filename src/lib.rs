@@ -344,9 +344,35 @@ pub trait Standalone: Sized {
                     // Register signal handlers.
 
                     // ISSUE #5: handle error codes here.
-                    let _ = unsafe { signal(SIGTERM, handler as sighandler_t) };
-                    let _ = unsafe { signal(SIGINT, handler as sighandler_t) };
-                    let _ = unsafe { signal(SIGHUP, handler as sighandler_t) };
+                    if let Err(err) = unsafe {
+                        signal(SIGTERM, handler as sighandler_t)
+                    } {
+                        error!(target: "standalone"
+                               "error registering signal handler: {}",
+                               err);
+
+                        Self::shutdown(create_cleanup, None);
+                    };
+
+                    if let Err(err) = unsafe {
+                        signal(SIGINT, handler as sighandler_t)
+                    } {
+                        error!(target: "standalone"
+                               "error registering signal handler: {}",
+                               err);
+
+                        Self::shutdown(create_cleanup, None);
+                    };
+
+                    if let Err(err) = unsafe {
+                        signal(SIGHUP, handler as sighandler_t)
+                    } {
+                        error!(target: "standalone"
+                               "error registering signal handler: {}",
+                               err);
+
+                        Self::shutdown(create_cleanup, None);
+                    };
 
                     match app.run() {
                         Ok(run_cleanup) => {
