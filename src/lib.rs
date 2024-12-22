@@ -27,6 +27,7 @@
 //! configurations, setting up logging, and other tasks in a common
 //! manner.
 
+use std::ffi::CString;
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::exit;
@@ -36,6 +37,7 @@ use std::sync::Mutex;
 use libc::c_int;
 use libc::sighandler_t;
 use libc::signal;
+use libc::strerror;
 use libc::SIGHUP;
 use libc::SIGINT;
 use libc::SIGTERM;
@@ -344,34 +346,34 @@ pub trait Standalone: Sized {
                     // Register signal handlers.
 
                     // ISSUE #5: handle error codes here.
-                    if let Err(err) = unsafe {
-                        signal(SIGTERM, handler as sighandler_t)
-                    } {
-                        error!(target: "standalone"
-                               "error registering signal handler: {}",
-                               err);
+                    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
+                        0 => {},
+                        err => {
+                            report_signal_error(err);
+                            Self::shutdown(create_cleanup, None);
 
-                        Self::shutdown(create_cleanup, None);
+                            return;
+                        }
                     };
 
-                    if let Err(err) = unsafe {
-                        signal(SIGINT, handler as sighandler_t)
-                    } {
-                        error!(target: "standalone"
-                               "error registering signal handler: {}",
-                               err);
+                    match unsafe { signal(SIGINT, handler as sighandler_t) } {
+                        0 => {},
+                        err => {
+                            report_signal_error(err);
+                            Self::shutdown(create_cleanup, None);
 
-                        Self::shutdown(create_cleanup, None);
+                            return;
+                        }
                     };
 
-                    if let Err(err) = unsafe {
-                        signal(SIGHUP, handler as sighandler_t)
-                    } {
-                        error!(target: "standalone"
-                               "error registering signal handler: {}",
-                               err);
+                    match unsafe { signal(SIGHUP, handler as sighandler_t) } {
+                        0 => {},
+                        err => {
+                            report_signal_error(err);
+                            Self::shutdown(create_cleanup, None);
 
-                        Self::shutdown(create_cleanup, None);
+                            return;
+                        }
                     };
 
                     match app.run() {
@@ -436,6 +438,33 @@ unsafe extern "C" fn handler(sig: c_int) {
 
     // ISSUE #3: this can lose notifications.
     SHUTDOWN_COND.notify_all()
+}
+
+fn report_signal_error(
+    err: usize
+) {
+    let cstr = unsafe {
+        let raw = strerror(err as i32);
+
+        if raw.is_null() {
+            CString::from_vec_unchecked(vec![0])
+        } else {
+            CString::from_raw(raw)
+        }
+    };
+
+    match cstr.into_string() {
+        Ok(str) => {
+            error!(target: "standalone",
+                   "error registering signal handler: {}",
+                   str);
+        },
+        Err(err) => {
+            error!(target: "standalone",
+                   "error converting string: {}",
+                   err)
+        }
+    }
 }
 
 fn bootstrap_log_setup() -> Handle {
