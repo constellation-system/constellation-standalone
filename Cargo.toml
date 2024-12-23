@@ -39,7 +39,7 @@ openssl-vendored = ["constellation-common/openssl-vendored"]
 unix = ["constellation-common/unix"]
 
 [dependencies]
-constellation-common = { git = "https://github.com/constellation-system/constellation-common.git", branch = "devel", default-features = false }
+constellation-common = { path = "../constellation-common/", default-features = false }
 libc = { version = "0.2" }
 log = { version = "0.4", optional = true }
 log4rs = { version = "1.2", optional = true }
