@@ -29,11 +29,11 @@
 
 use std::ffi::CString;
 use std::fs::File;
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::Condvar;
-use std::sync::Mutex;
 
+use constellation_common::sync::Notify;
 use libc::c_int;
 use libc::sighandler_t;
 use libc::signal;
@@ -345,9 +345,12 @@ pub trait Standalone: Sized {
                 Ok((app, create_cleanup)) => {
                     // Register signal handlers.
 
-                    // ISSUE #5: handle error codes here.
+                    unsafe {
+                        SHUTDOWN_NOTIFY.write(Notify::new());
+                    }
+
                     match unsafe { signal(SIGTERM, handler as sighandler_t) } {
-                        0 => {},
+                        0 => {}
                         err => {
                             report_signal_error(err);
                             Self::shutdown(create_cleanup, None);
@@ -357,7 +360,7 @@ pub trait Standalone: Sized {
                     };
 
                     match unsafe { signal(SIGINT, handler as sighandler_t) } {
-                        0 => {},
+                        0 => {}
                         err => {
                             report_signal_error(err);
                             Self::shutdown(create_cleanup, None);
@@ -367,7 +370,7 @@ pub trait Standalone: Sized {
                     };
 
                     match unsafe { signal(SIGHUP, handler as sighandler_t) } {
-                        0 => {},
+                        0 => {}
                         err => {
                             report_signal_error(err);
                             Self::shutdown(create_cleanup, None);
@@ -378,22 +381,15 @@ pub trait Standalone: Sized {
 
                     match app.run() {
                         Ok(run_cleanup) => {
-                            // Successfully started; wait for a
-                            // terminating signal.
-                            match Mutex::new(()).lock() {
-                                Ok(guard) => {
-                                    // ISSUE #3: this is vulnerable to
-                                    // spurious wakeups
-                                    if SHUTDOWN_COND.wait(guard).is_err() {
-                                        error!(target: "standalone",
-                                               "bad condition variable")
-                                    }
-                                }
-                                Err(_) => {
-                                    error!(target: "standalone",
-                                           "bad condition variable")
-                                }
-                            };
+                            if unsafe {
+                                SHUTDOWN_NOTIFY
+                                    .assume_init_mut()
+                                    .wait_no_reset()
+                                    .is_err()
+                            } {
+                                error!(target: "standalone",
+                                       "bad condition variable")
+                            }
 
                             Self::shutdown(create_cleanup, Some(run_cleanup));
 
@@ -424,7 +420,7 @@ pub trait Standalone: Sized {
     }
 }
 
-static SHUTDOWN_COND: Condvar = Condvar::new();
+static mut SHUTDOWN_NOTIFY: MaybeUninit<Notify> = MaybeUninit::uninit();
 static mut SHUTDOWN_ON_INT: bool = false;
 
 unsafe extern "C" fn handler(sig: c_int) {
@@ -436,13 +432,14 @@ unsafe extern "C" fn handler(sig: c_int) {
         }
     }
 
-    // ISSUE #3: this can lose notifications.
-    SHUTDOWN_COND.notify_all()
+    if let Err(err) = SHUTDOWN_NOTIFY.assume_init_mut().notify() {
+        error!(target: "signal-handler",
+               "error sending shutdown notification: {}",
+               err);
+    }
 }
 
-fn report_signal_error(
-    err: usize
-) {
+fn report_signal_error(err: usize) {
     let cstr = unsafe {
         let raw = strerror(err as i32);
 
@@ -458,7 +455,7 @@ fn report_signal_error(
             error!(target: "standalone",
                    "error registering signal handler: {}",
                    str);
-        },
+        }
         Err(err) => {
             error!(target: "standalone",
                    "error converting string: {}",
