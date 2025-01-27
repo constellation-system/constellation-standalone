@@ -31,10 +31,15 @@ exclude = [
 edition = "2018"
 
 [features]
-default = ["log"]
-log = ["dep:log", "dep:log4rs"]
+default = ["gssapi", "log", "openssl", "unix"]
+gssapi = ["constellation-common/gssapi"]
+log = ["dep:log", "dep:log4rs", "constellation-common/log"]
+openssl = ["constellation-common/openssl"]
+openssl-vendored = ["constellation-common/openssl-vendored"]
+unix = ["constellation-common/unix"]
 
 [dependencies]
+constellation-common = { git = "https://github.com/constellation-system/constellation-common.git", branch = "devel", default-features = false }
 libc = { version = "0.2" }
 log = { version = "0.4", optional = true }
 log4rs = { version = "1.2", optional = true }
