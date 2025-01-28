@@ -40,6 +40,7 @@ unix = ["constellation-common/unix"]
 
 [dependencies]
 constellation-common = { git = "https://github.com/constellation-system/constellation-common.git", branch = "project/ioc-caps", default-features = false }
+clap = { version = "4.5", features = ["cargo"] }
 libc = { version = "0.2" }
 log = { version = "0.4", optional = true }
 log4rs = { version = "1.2", optional = true }
