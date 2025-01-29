@@ -43,6 +43,7 @@ use clap::ArgAction;
 use clap::ArgMatches;
 use clap::Command;
 use constellation_common::sync::Notify;
+use constellation_common::version::FullVersion;
 use libc::c_int;
 use libc::sighandler_t;
 use libc::signal;
@@ -121,7 +122,7 @@ pub trait Standalone: Sized {
         &["constellation-log.yaml"];
 
     /// Version string for this application.
-    const VERSION: &str;
+    const VERSION: FullVersion;
 
     /// Type of configuration objects.
     type Config: for<'de> Deserialize<'de>;
@@ -469,7 +470,7 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
 /// Set up command-line argument parser.
 fn cmdargs_setup<S: Standalone>() -> Command {
     let mut cmd = command!()
-        .version(S::VERSION)
+        .version(S::VERSION.to_string())
         .arg(
             Arg::new("confdir")
                 .short('c')
