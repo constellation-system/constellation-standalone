@@ -1,4 +1,4 @@
-# Copyright © 2024 The Johns Hopkins Applied Physics Laboratory LLC.
+# Copyright © 2024-25 The Johns Hopkins Applied Physics Laboratory LLC.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License, version
@@ -21,7 +21,7 @@ name = "constellation-standalone"
 description = "Standalone executable support for the Constellation distributed systems platform"
 repository = "https://github.com/constellation-system/constellation-standalone"
 version = "0.0.0"
-rust-version = "1.81"
+rust-version = "1.83"
 license = "AGPL-3.0-only"
 keywords = []
 categories = []

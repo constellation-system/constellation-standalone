@@ -1,4 +1,4 @@
-// Copyright © 2024 The Johns Hopkins Applied Physics Laboratory LLC.
+// Copyright © 2024-25 The Johns Hopkins Applied Physics Laboratory LLC.
 //
 // This program is free software: you can redistribute it and/or
 // modify it under the terms of the GNU Affero General Public License,
@@ -346,6 +346,7 @@ pub trait Standalone: Sized {
                     // Register signal handlers.
 
                     unsafe {
+                        #[allow(static_mut_refs)]
                         SHUTDOWN_NOTIFY.write(Notify::new());
                     }
 
@@ -382,6 +383,7 @@ pub trait Standalone: Sized {
                     match app.run() {
                         Ok(run_cleanup) => {
                             if unsafe {
+                                #[allow(static_mut_refs)]
                                 SHUTDOWN_NOTIFY
                                     .assume_init_mut()
                                     .wait_no_reset()
@@ -432,6 +434,7 @@ unsafe extern "C" fn handler(sig: c_int) {
         }
     }
 
+    #[allow(static_mut_refs)]
     if let Err(err) = SHUTDOWN_NOTIFY.assume_init_mut().notify() {
         error!(target: "signal-handler",
                "error sending shutdown notification: {}",
