@@ -13,3 +13,4 @@ common manner.
 
 * [Developer documentation for `devel` branch](https://constellation-system.github.io/constellation-standalone/index.html)
 * [Coverage reports for `devel` branch](https://constellation-system.github.io/constellation-standalone/coverage/index.html)
+* [Contribution guide](https://github.com/constellation-system/constellation-standalone/blob/devel/CONTRIBUTING.md)
