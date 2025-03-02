@@ -224,7 +224,10 @@ pub trait StandaloneService: Standalone {
                                            "bad condition variable")
                                 }
 
-                                Self::shutdown(create_cleanup, Some(run_cleanup));
+                                Self::shutdown(
+                                    create_cleanup,
+                                    Some(run_cleanup)
+                                );
 
                                 info!(target: "standalone",
                                       "{} shutdown successful",
@@ -300,9 +303,7 @@ pub trait StandaloneApp: Standalone {
     /// The two cleanup objects `create` and `run` are the same that
     /// are returned by [create](Standalone::create) and
     /// [run](Standalone::run).
-    fn cleanup(
-        create: Self::CreateCleanup,
-    );
+    fn cleanup(create: Self::CreateCleanup);
 
     /// Shut down the component and clean up any resources in the
     /// event of an error.
