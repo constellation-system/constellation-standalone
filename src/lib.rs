@@ -42,6 +42,7 @@ use clap::Arg;
 use clap::ArgAction;
 use clap::ArgMatches;
 use clap::Command;
+use constellation_common::shutdown::ShutdownFlag;
 use constellation_common::sync::Notify;
 use constellation_common::version::FullVersion;
 use libc::c_int;
@@ -68,11 +69,10 @@ use serde::Deserialize;
 const CONFDIR_ENV_NAME: &str = "CONSTELLATION_CONFDIR";
 const LOGLVL_ENV_NAME: &str = "CONSTELLATION_LOGLVL";
 
-/// Trait to be implemented by standalone components.
+/// Base trait for standalone components.
 ///
-/// This provides a [main](Standalone::main) function that can be
-/// called directly from the top-level `main`.  It also manages the
-/// following tasks:
+/// This trait defines a common interface used by [StandaloneService]
+/// and [StandaloneApp] to manage the following tasks:
 ///
 /// * Identifying the location of configuration files, and reading them in.
 ///
@@ -83,15 +83,6 @@ const LOGLVL_ENV_NAME: &str = "CONSTELLATION_LOGLVL";
 /// * Setting up and running the component.
 ///
 /// * Cleanly shutting down.
-///
-/// # Usage
-///
-/// In order to use the facilities provided by this trait, a top-level
-/// Constellation component should implement it, which provides the
-/// necessary definitions for the configuration types, how to
-/// initialize the component, how to run it, and how to shut it down.
-///
-/// The `main` function should then simply call [Standalone::main].
 pub trait Standalone: Sized {
     const CONFIG_DIR_ENV: &'static str = "CONSTELLATION_CONF_DIR";
 
@@ -106,7 +97,7 @@ pub trait Standalone: Sized {
     const HOME_CONFIG_SUBDIR: &'static str = ".config/constellation/";
 
     /// Name of the standalone component.
-    const COMPONENT_NAME: &'static str;
+    const NAME: &'static str;
 
     /// Possible names of component configuration files.
     ///
@@ -127,12 +118,6 @@ pub trait Standalone: Sized {
     /// Type of configuration objects.
     type Config: for<'de> Deserialize<'de>;
 
-    /// Type of cleanup objects from [run](Standalone::run).
-    type RunCleanup;
-
-    /// Type of cleanup objects produced from errors in [run](Standalone::run).
-    type RunErrorCleanup;
-
     /// Type of cleanup objects from [run](Standalone::create).
     type CreateCleanup;
 
@@ -144,6 +129,38 @@ pub trait Standalone: Sized {
         args: ArgMatches,
         config: Self::Config
     ) -> Result<(Self, Self::CreateCleanup), Self::CreateCleanup>;
+}
+
+/// Trait for standalone services.
+///
+/// This provides a [main](Standalone::main) function that can be
+/// called directly from the top-level `main`.  It also manages the
+/// following tasks:
+///
+/// * Identifying the location of configuration files, and reading them in.
+///
+/// * Setting up logging.
+///
+/// * Setting up signal handlers to trigger shutdown.
+///
+/// * Setting up and running the component as a service.
+///
+/// * Cleanly shutting down.
+///
+/// # Usage
+///
+/// In order to use the facilities provided by this trait, a top-level
+/// Constellation component should implement it, which will provide
+/// the necessary definitions for the configuration types, how to
+/// initialize the component, how to run it, and how to shut it down.
+///
+/// The `main` function should then simply call [Standalone::main].
+pub trait StandaloneService: Standalone {
+    /// Type of cleanup objects from [run](Standalone::run).
+    type RunCleanup;
+
+    /// Type of cleanup objects produced from errors in [run](Standalone::run).
+    type RunErrorCleanup;
 
     /// Entrypoint for the component.
     fn run(self) -> Result<Self::RunCleanup, Self::RunErrorCleanup>;
@@ -198,65 +215,32 @@ pub trait Standalone: Sized {
         if let Some(config) = load_config::<Self>(&dirs) {
             match Self::create(arg_matches, config) {
                 Ok((app, create_cleanup)) => {
-                    // Register signal handlers.
+                    // Register signal handlers and start the service.
+                    if let Ok(notify) = service_shutdown_signals(true) {
+                        match app.run() {
+                            Ok(run_cleanup) => {
+                                if notify.wait_no_reset().is_err() {
+                                    error!(target: "standalone",
+                                           "bad condition variable")
+                                }
 
-                    unsafe {
-                        #[allow(static_mut_refs)]
-                        SHUTDOWN_NOTIFY.write(Notify::new());
-                    }
+                                Self::shutdown(
+                                    create_cleanup,
+                                    Some(run_cleanup)
+                                );
 
-                    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
-                        0 => {}
-                        err => {
-                            report_signal_error(err);
-                            Self::shutdown(create_cleanup, None);
-
-                            return;
-                        }
-                    };
-
-                    match unsafe { signal(SIGINT, handler as sighandler_t) } {
-                        0 => {}
-                        err => {
-                            report_signal_error(err);
-                            Self::shutdown(create_cleanup, None);
-
-                            return;
-                        }
-                    };
-
-                    match unsafe { signal(SIGHUP, handler as sighandler_t) } {
-                        0 => {}
-                        err => {
-                            report_signal_error(err);
-                            Self::shutdown(create_cleanup, None);
-
-                            return;
-                        }
-                    };
-
-                    match app.run() {
-                        Ok(run_cleanup) => {
-                            if unsafe {
-                                #[allow(static_mut_refs)]
-                                SHUTDOWN_NOTIFY
-                                    .assume_init_mut()
-                                    .wait_no_reset()
-                                    .is_err()
-                            } {
-                                error!(target: "standalone",
-                                       "bad condition variable")
+                                info!(target: "standalone",
+                                      "{} shutdown successful",
+                                      Self::NAME);
                             }
+                            Err(err) => {
+                                Self::shutdown_err(create_cleanup, err);
 
-                            Self::shutdown(create_cleanup, Some(run_cleanup));
-
-                            info!(target: "standalone",
-                                  "{} shutdown successful",
-                                  Self::COMPONENT_NAME);
+                                std::process::exit(1);
+                            }
                         }
-                        Err(err) => {
-                            Self::shutdown_err(create_cleanup, err);
-                        }
+                    } else {
+                        Self::shutdown(create_cleanup, None);
                     }
                 }
                 Err(cleanup) => {
@@ -267,14 +251,140 @@ pub trait Standalone: Sized {
 
                     info!(target: "standalone",
                           "{} cleaned up after error",
-                          Self::COMPONENT_NAME);
+                          Self::NAME);
+
+                    std::process::exit(1);
                 }
             }
         } else {
             error!(target: "load-config",
                    "could not obtain valid configuration");
+
+            std::process::exit(1);
         }
     }
+}
+/// Trait for standalone applications.
+///
+/// This provides a [main](Standalone::main) function that can be
+/// called directly from the top-level `main`.  It also manages the
+/// following tasks:
+///
+/// * Identifying the location of configuration files, and reading them in.
+///
+/// * Setting up logging.
+///
+/// * Setting up signal handlers to trigger shutdown.
+///
+/// * Setting up and running the application.
+///
+/// * Cleanly shutting down.
+///
+/// # Usage
+///
+/// In order to use the facilities provided by this trait, a top-level
+/// Constellation component should implement it, which will provide
+/// the necessary definitions for the configuration types, how to
+/// initialize the component, how to run it, and how to shut it down.
+///
+/// The `main` function should then simply call [Standalone::main].
+pub trait StandaloneApp: Standalone {
+    /// Type of cleanup objects produced from errors in [run](Standalone::run).
+    type RunErrorCleanup;
+
+    /// Entrypoint for the component.
+    fn run(
+        self,
+        shutdown: ShutdownFlag
+    ) -> Result<(), Self::RunErrorCleanup>;
+
+    /// Shut down the component and clean up any resources.
+    ///
+    /// The two cleanup objects `create` and `run` are the same that
+    /// are returned by [create](Standalone::create) and
+    /// [run](Standalone::run).
+    fn cleanup(create: Self::CreateCleanup);
+
+    /// Shut down the component and clean up any resources in the
+    /// event of an error.
+    ///
+    /// The two cleanup objects `create` and `run` are the same that
+    /// are returned by [create](Standalone::create) and
+    /// [run](Standalone::run) (if it returned an error).
+    fn cleanup_err(
+        create: Self::CreateCleanup,
+        run: Self::RunErrorCleanup
+    );
+
+    /// A complete `main` function implementation for a standalone
+    /// component.
+    ///
+    /// This can be called from the executable `main` as its only
+    /// content.
+    fn main() {
+        let mut arg_matches = cmdargs_setup::<Self>().get_matches();
+        let Args { confdir, loglvl } = match get_args::<Self>(&mut arg_matches)
+        {
+            Ok(args) => args,
+            Err(err) => {
+                eprintln!("{}", err);
+
+                std::process::exit(1);
+            }
+        };
+
+        // First set up the bootstrap logger.
+        let handle = bootstrap_log_setup(loglvl);
+
+        // Get the configuration directories.
+        let dirs = config_dirs::<Self>(confdir);
+
+        // Set up the permanent logger.
+        log_setup::<Self>(&dirs, &handle);
+
+        if let Some(config) = load_config::<Self>(&dirs) {
+            match Self::create(arg_matches, config) {
+                Ok((app, create_cleanup)) => {
+                    // Register signal handlers and start the service.
+                    if let Ok(shutdown) = app_shutdown_signals(true) {
+                        match app.run(shutdown) {
+                            Ok(()) => {
+                                Self::cleanup(create_cleanup);
+                            }
+                            Err(err) => {
+                                Self::cleanup_err(create_cleanup, err);
+
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        Self::cleanup(create_cleanup);
+                    }
+                }
+                Err(cleanup) => {
+                    debug!(target: "standalone",
+                           "cleaning up after create error");
+
+                    Self::cleanup(cleanup);
+
+                    info!(target: "standalone",
+                          "{} cleaned up after error",
+                          Self::NAME);
+
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            error!(target: "load-config",
+                   "could not obtain valid configuration");
+
+            std::process::exit(1);
+        }
+    }
+}
+
+pub enum MainError {
+    LoadConfError
 }
 
 struct Args {
@@ -284,23 +394,127 @@ struct Args {
     confdir: Option<PathBuf>
 }
 
-static mut SHUTDOWN_NOTIFY: MaybeUninit<Notify> = MaybeUninit::uninit();
-static mut SHUTDOWN_ON_INT: bool = false;
+struct RegisterSignalsError;
 
-unsafe extern "C" fn handler(sig: c_int) {
-    if sig == SIGINT {
-        if SHUTDOWN_ON_INT {
-            exit(1);
-        } else {
-            SHUTDOWN_ON_INT = true
+fn service_shutdown_signals(
+    sighup: bool
+) -> Result<&'static mut Notify, RegisterSignalsError> {
+    static mut SHUTDOWN_NOTIFY: MaybeUninit<Notify> = MaybeUninit::uninit();
+    static mut SHUTDOWN_ON_INT: bool = false;
+
+    unsafe extern "C" fn handler(sig: c_int) {
+        if sig == SIGINT {
+            if SHUTDOWN_ON_INT {
+                exit(1);
+            } else {
+                SHUTDOWN_ON_INT = true
+            }
+        }
+
+        #[allow(static_mut_refs)]
+        if let Err(err) = SHUTDOWN_NOTIFY.assume_init_mut().notify() {
+            error!(target: "signal-handler",
+                   "error sending shutdown notification: {}",
+                   err);
         }
     }
 
-    #[allow(static_mut_refs)]
-    if let Err(err) = SHUTDOWN_NOTIFY.assume_init_mut().notify() {
-        error!(target: "signal-handler",
-               "error sending shutdown notification: {}",
-               err);
+    unsafe {
+        #[allow(static_mut_refs)]
+        SHUTDOWN_NOTIFY.write(Notify::new());
+    }
+
+    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
+        0 => Ok(()),
+        err => {
+            report_signal_error(err);
+
+            Err(RegisterSignalsError)
+        }
+    }?;
+
+    match unsafe { signal(SIGINT, handler as sighandler_t) } {
+        0 => Ok(()),
+        err => {
+            report_signal_error(err);
+
+            Err(RegisterSignalsError)
+        }
+    }?;
+
+    if sighup {
+        match unsafe { signal(SIGHUP, handler as sighandler_t) } {
+            0 => Ok(()),
+            err => {
+                report_signal_error(err);
+
+                Err(RegisterSignalsError)
+            }
+        }?;
+    }
+
+    unsafe {
+        #[allow(static_mut_refs)]
+        Ok(SHUTDOWN_NOTIFY.assume_init_mut())
+    }
+}
+
+fn app_shutdown_signals(
+    sighup: bool
+) -> Result<ShutdownFlag, RegisterSignalsError> {
+    static mut SHUTDOWN: MaybeUninit<ShutdownFlag> = MaybeUninit::uninit();
+    static mut SHUTDOWN_ON_INT: bool = false;
+
+    unsafe extern "C" fn handler(sig: c_int) {
+        if sig == SIGINT {
+            if SHUTDOWN_ON_INT {
+                exit(1);
+            } else {
+                SHUTDOWN_ON_INT = true
+            }
+        }
+
+        #[allow(static_mut_refs)]
+        SHUTDOWN.assume_init_mut().set();
+    }
+
+    unsafe {
+        #[allow(static_mut_refs)]
+        SHUTDOWN.write(ShutdownFlag::new());
+    }
+
+    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
+        0 => Ok(()),
+        err => {
+            report_signal_error(err);
+
+            Err(RegisterSignalsError)
+        }
+    }?;
+
+    match unsafe { signal(SIGINT, handler as sighandler_t) } {
+        0 => Ok(()),
+        err => {
+            report_signal_error(err);
+
+            Err(RegisterSignalsError)
+        }
+    }?;
+
+    if sighup {
+        match unsafe { signal(SIGHUP, handler as sighandler_t) } {
+            0 => Ok(()),
+            err => {
+                report_signal_error(err);
+
+                Err(RegisterSignalsError)
+            }
+        }?;
+    }
+
+    unsafe {
+        #[allow(static_mut_refs)]
+        Ok(SHUTDOWN.assume_init_mut().clone())
     }
 }
 
@@ -358,7 +572,7 @@ fn bootstrap_log_setup(loglvl: LevelFilter) -> Handle {
 
 fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
     let component_confdir_env_name =
-        format!("CONSTELLATION_{}_CONFDIR", S::COMPONENT_NAME.to_uppercase());
+        format!("CONSTELLATION_{}_CONFDIR", S::NAME.to_uppercase());
     let component_confdir_env = match std::env::var(&component_confdir_env_name)
     {
         Ok(val) => Ok(Some(val)),
@@ -383,7 +597,7 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
         .map(PathBuf::from);
     // let component_pidfile_env_name = format!(
     // "CONSTELLATION_{}_PIDFILE",
-    // S::COMPONENT_NAME.to_uppercase()
+    // S::NAME.to_uppercase()
     // );
     // let component_pidfile_env =
     // match std::env::var(&component_pidfile_env_name) {
@@ -408,7 +622,7 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
         _ => Err("More than three verbose flags is redundant")
     }?;
     let component_loglvl_env_name =
-        format!("CONSTELLATION_{}_LOGLVL", S::COMPONENT_NAME.to_uppercase());
+        format!("CONSTELLATION_{}_LOGLVL", S::NAME.to_uppercase());
     let component_loglvl_env = match std::env::var(&component_loglvl_env_name) {
         Ok(val) => {
             if verbose == 0 {
