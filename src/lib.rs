@@ -44,6 +44,7 @@ use clap::ArgMatches;
 use clap::Command;
 use constellation_common::shutdown::ShutdownFlag;
 use constellation_common::sync::Notify;
+use constellation_common::sync::NotifyIdx;
 use constellation_common::version::FullVersion;
 use libc::c_int;
 use libc::sighandler_t;
@@ -122,7 +123,9 @@ pub trait Standalone: Sized {
     type CreateCleanup;
 
     /// Add command-line arguments to be parsed.
-    fn cmdargs(_cmd: &mut Command) {}
+    fn cmdargs(cmd: Command) -> Command {
+        cmd
+    }
 
     /// Create an instance of the component from a configuration.
     fn create(
@@ -216,10 +219,10 @@ pub trait StandaloneService: Standalone {
             match Self::create(arg_matches, config) {
                 Ok((app, create_cleanup)) => {
                     // Register signal handlers and start the service.
-                    if let Ok(notify) = service_shutdown_signals(true) {
+                    if let Ok((notify, idx)) = service_shutdown_signals(true) {
                         match app.run() {
                             Ok(run_cleanup) => {
-                                if notify.wait_no_reset().is_err() {
+                                if notify.wait_no_reset(&idx).is_err() {
                                     error!(target: "standalone",
                                            "bad condition variable")
                                 }
@@ -398,7 +401,7 @@ struct RegisterSignalsError;
 
 fn service_shutdown_signals(
     sighup: bool
-) -> Result<&'static mut Notify, RegisterSignalsError> {
+) -> Result<(&'static mut Notify, NotifyIdx), RegisterSignalsError> {
     static mut SHUTDOWN_NOTIFY: MaybeUninit<Notify> = MaybeUninit::uninit();
     static mut SHUTDOWN_ON_INT: bool = false;
 
@@ -455,7 +458,18 @@ fn service_shutdown_signals(
 
     unsafe {
         #[allow(static_mut_refs)]
-        Ok(SHUTDOWN_NOTIFY.assume_init_mut())
+        let notify = SHUTDOWN_NOTIFY.assume_init_mut();
+
+        match notify.register() {
+            Ok(idx) => Ok((notify, idx)),
+            Err(err) => {
+                error!(target: "standalone",
+                       "error registering notify: {}",
+                       err);
+
+                Err(RegisterSignalsError)
+            }
+        }
     }
 }
 
@@ -686,7 +700,7 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
 
 /// Set up command-line argument parser.
 fn cmdargs_setup<S: Standalone>() -> Command {
-    let mut cmd = command!()
+    let cmd = command!()
         .version(S::VERSION.to_string())
         .arg(
             Arg::new("confdir")
@@ -720,9 +734,7 @@ fn cmdargs_setup<S: Standalone>() -> Command {
                 .action(ArgAction::Count)
         );
 
-    S::cmdargs(&mut cmd);
-
-    cmd
+    S::cmdargs(cmd)
 }
 
 /// Get the set of configuration directories to search for
