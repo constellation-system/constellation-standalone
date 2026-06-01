@@ -427,7 +427,7 @@ fn service_shutdown_signals(
         SHUTDOWN_NOTIFY.write(Notify::new());
     }
 
-    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
+    match unsafe { signal(SIGTERM, handler as *const() as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -436,7 +436,7 @@ fn service_shutdown_signals(
         }
     }?;
 
-    match unsafe { signal(SIGINT, handler as sighandler_t) } {
+    match unsafe { signal(SIGINT, handler as *const() as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -446,7 +446,7 @@ fn service_shutdown_signals(
     }?;
 
     if sighup {
-        match unsafe { signal(SIGHUP, handler as sighandler_t) } {
+        match unsafe { signal(SIGHUP, handler as *const() as sighandler_t) } {
             0 => Ok(()),
             err => {
                 report_signal_error(err);
@@ -497,7 +497,7 @@ fn app_shutdown_signals(
         SHUTDOWN.write(ShutdownFlag::new());
     }
 
-    match unsafe { signal(SIGTERM, handler as sighandler_t) } {
+    match unsafe { signal(SIGTERM, handler as *const() as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -506,7 +506,7 @@ fn app_shutdown_signals(
         }
     }?;
 
-    match unsafe { signal(SIGINT, handler as sighandler_t) } {
+    match unsafe { signal(SIGINT, handler as *const() as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -516,7 +516,7 @@ fn app_shutdown_signals(
     }?;
 
     if sighup {
-        match unsafe { signal(SIGHUP, handler as sighandler_t) } {
+        match unsafe { signal(SIGHUP, handler as *const() as sighandler_t) } {
             0 => Ok(()),
             err => {
                 report_signal_error(err);
