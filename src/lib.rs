@@ -32,10 +32,11 @@
 use std::env::VarError;
 use std::ffi::CString;
 use std::fs::File;
-use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::Ordering;
 
 use clap::command;
 use clap::Arg;
@@ -43,9 +44,8 @@ use clap::ArgAction;
 use clap::ArgMatches;
 use clap::Command;
 use constellation_common::shutdown::ShutdownFlag;
-use constellation_common::sync::Notify;
-use constellation_common::sync::NotifyIdx;
 use constellation_common::version::FullVersion;
+use daemonize::Daemonize;
 use libc::c_int;
 use libc::sighandler_t;
 use libc::signal;
@@ -67,8 +67,16 @@ use log4rs::Config;
 use log4rs::Handle;
 use serde::Deserialize;
 
-const CONFDIR_ENV_NAME: &str = "CONSTELLATION_CONFDIR";
-const LOGLVL_ENV_NAME: &str = "CONSTELLATION_LOGLVL";
+const DEFAULT_CONFDIR_ENV_NAME: &str = "CONSTELLATION_CONFDIR";
+const DEFAULT_RUNDIR_ENV_NAME: &str = "CONSTELLATION_RUNDIR";
+const DEFAULT_LOGLVL_ENV_NAME: &str = "CONSTELLATION_LOGLVL";
+const DEFAULT_USER_ENV_NAME: &str = "CONSTELLATION_USER";
+const DEFAULT_GROUP_ENV_NAME: &str = "CONSTELLATION_GROUP";
+const DEFAULT_RUNDIR: &str = "/var/run/constellation";
+const DEFAULT_SYSTEM_CONFDIR: &str = "/usr/local/etc/constellation";
+const DEFAULT_HOME_CONFSUBDIR: &str = ".config/constellation";
+const DEFAULT_USER: &str = "constellation";
+const DEFAULT_GROUP: &str = "constellation";
 
 /// Base trait for standalone components.
 ///
@@ -85,33 +93,33 @@ const LOGLVL_ENV_NAME: &str = "CONSTELLATION_LOGLVL";
 ///
 /// * Cleanly shutting down.
 pub trait Standalone: Sized {
-    const CONFIG_DIR_ENV: &'static str = "CONSTELLATION_CONF_DIR";
+    const LOGLVL_ENV: &str = DEFAULT_LOGLVL_ENV_NAME;
+    const CONFIG_DIR_ENV: &str = DEFAULT_CONFDIR_ENV_NAME;
 
     /// Location of the system-wide configuration directory.
     ///
     /// Defaults to `/usr/local/etc/constellation`.
-    const SYSTEM_CONFIG_DIR: &'static str = "/usr/local/etc/constellation/";
+    const SYSTEM_CONFIG_DIR: &str = DEFAULT_SYSTEM_CONFDIR;
 
     /// Subdirectory under which home directory configurations are stored.
     ///
     /// Defaults to `.config/constellation`.
-    const HOME_CONFIG_SUBDIR: &'static str = ".config/constellation/";
+    const HOME_CONFIG_SUBDIR: &str = DEFAULT_HOME_CONFSUBDIR;
 
     /// Name of the standalone component.
-    const NAME: &'static str;
+    const NAME: &str;
 
     /// Possible names of component configuration files.
     ///
     /// These are given in order of preference.
-    const CONFIG_FILES: &'static [&'static str];
+    const CONFIG_FILES: &[&str];
 
     /// Possible names of logging configuration files.
     ///
     /// These are given in order of preference.
     ///
     /// Defaults to a single entry, `constellation-log.yaml`.
-    const LOG_CONFIG_FILES: &'static [&'static str] =
-        &["constellation-log.yaml"];
+    const LOG_CONFIG_FILES: &[&str] = &["constellation-log.yaml"];
 
     /// Version string for this application.
     const VERSION: FullVersion;
@@ -159,6 +167,14 @@ pub trait Standalone: Sized {
 ///
 /// The `main` function should then simply call [Standalone::main].
 pub trait StandaloneService: Standalone {
+    const RUN_DIR_ENV: &str = DEFAULT_RUNDIR_ENV_NAME;
+    const USER_ENV: &str = DEFAULT_USER_ENV_NAME;
+    const GROUP_ENV: &str = DEFAULT_GROUP_ENV_NAME;
+    const DEFAULT_RUN_DIR: &str = DEFAULT_RUNDIR;
+    const DEFAULT_USER: Option<&str> = Some(DEFAULT_USER);
+    const DEFAULT_GROUP: Option<&str> = Some(DEFAULT_GROUP);
+    const DEFAULT_PIDFILE: &str;
+
     /// Type of cleanup objects from [run](Standalone::run).
     type RunCleanup;
 
@@ -166,7 +182,10 @@ pub trait StandaloneService: Standalone {
     type RunErrorCleanup;
 
     /// Entrypoint for the component.
-    fn run(self) -> Result<Self::RunCleanup, Self::RunErrorCleanup>;
+    fn run(
+        self,
+        rundir: PathBuf
+    ) -> Result<Self::RunCleanup, Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
     ///
@@ -195,9 +214,25 @@ pub trait StandaloneService: Standalone {
     /// This can be called from the executable `main` as its only
     /// content.
     fn main() {
-        let mut arg_matches = cmdargs_setup::<Self>().get_matches();
+        let cmd = service_cmdargs::<Self>();
+        let cmd = Self::cmdargs(cmd);
+        let mut arg_matches = cmd.get_matches();
         let Args { confdir, loglvl } = match get_args::<Self>(&mut arg_matches)
         {
+            Ok(args) => args,
+            Err(err) => {
+                eprintln!("{}", err);
+
+                std::process::exit(1);
+            }
+        };
+        let ServiceArgs {
+            pidfile,
+            rundir,
+            daemon,
+            user,
+            group
+        } = match get_service_args::<Self>(&mut arg_matches) {
             Ok(args) => args,
             Err(err) => {
                 eprintln!("{}", err);
@@ -216,17 +251,33 @@ pub trait StandaloneService: Standalone {
         log_setup::<Self>(&dirs, &handle);
 
         if let Some(config) = load_config::<Self>(&dirs) {
+            if daemon {
+                let daemon =
+                    Daemonize::new().pid_file(&pidfile).chown_pid_file(true);
+
+                let daemon = if let Some(user) = user {
+                    daemon.user(user.as_str())
+                } else {
+                    daemon
+                };
+
+                let daemon = if let Some(group) = group {
+                    daemon.group(group.as_str())
+                } else {
+                    daemon
+                };
+
+                if let Err(err) = daemon.start() {
+                    error!("failed to detach from terminal: {}", err);
+                }
+            }
+
             match Self::create(arg_matches, config) {
                 Ok((app, create_cleanup)) => {
                     // Register signal handlers and start the service.
-                    if let Ok((notify, idx)) = service_shutdown_signals(true) {
-                        match app.run() {
+                    if shutdown_signals(true).is_ok() {
+                        match app.run(rundir) {
                             Ok(run_cleanup) => {
-                                if notify.wait_no_reset(&idx).is_err() {
-                                    error!(target: "standalone",
-                                           "bad condition variable")
-                                }
-
                                 Self::shutdown(
                                     create_cleanup,
                                     Some(run_cleanup)
@@ -259,9 +310,17 @@ pub trait StandaloneService: Standalone {
                     std::process::exit(1);
                 }
             }
+
+            // Delete the pidfile if we're a daemon.
+            if daemon {
+                if let Err(err) = std::fs::remove_file(pidfile) {
+                    error!("failed to remove pid file: {}", err);
+
+                    std::process::exit(1);
+                }
+            }
         } else {
-            error!(target: "load-config",
-                   "could not obtain valid configuration");
+            error!("could not obtain valid configuration");
 
             std::process::exit(1);
         }
@@ -296,10 +355,7 @@ pub trait StandaloneApp: Standalone {
     type RunErrorCleanup;
 
     /// Entrypoint for the component.
-    fn run(
-        self,
-        shutdown: ShutdownFlag
-    ) -> Result<(), Self::RunErrorCleanup>;
+    fn run(self) -> Result<(), Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
     ///
@@ -325,7 +381,9 @@ pub trait StandaloneApp: Standalone {
     /// This can be called from the executable `main` as its only
     /// content.
     fn main() {
-        let mut arg_matches = cmdargs_setup::<Self>().get_matches();
+        let cmd = cmdargs_setup::<Self>();
+        let cmd = Self::cmdargs(cmd);
+        let mut arg_matches = cmd.get_matches();
         let Args { confdir, loglvl } = match get_args::<Self>(&mut arg_matches)
         {
             Ok(args) => args,
@@ -349,8 +407,8 @@ pub trait StandaloneApp: Standalone {
             match Self::create(arg_matches, config) {
                 Ok((app, create_cleanup)) => {
                     // Register signal handlers and start the service.
-                    if let Ok(shutdown) = app_shutdown_signals(true) {
-                        match app.run(shutdown) {
+                    if shutdown_signals(true).is_ok() {
+                        match app.run() {
                             Ok(()) => {
                                 Self::cleanup(create_cleanup);
                             }
@@ -397,86 +455,53 @@ struct Args {
     confdir: Option<PathBuf>
 }
 
-struct RegisterSignalsError;
-
-fn service_shutdown_signals(
-    sighup: bool
-) -> Result<(&'static mut Notify, NotifyIdx), RegisterSignalsError> {
-    static mut SHUTDOWN_NOTIFY: MaybeUninit<Notify> = MaybeUninit::uninit();
-    static mut SHUTDOWN_ON_INT: bool = false;
-
-    unsafe extern "C" fn handler(sig: c_int) {
-        if sig == SIGINT {
-            if SHUTDOWN_ON_INT {
-                exit(1);
-            } else {
-                SHUTDOWN_ON_INT = true
-            }
-        }
-
-        #[allow(static_mut_refs)]
-        if let Err(err) = SHUTDOWN_NOTIFY.assume_init_mut().notify() {
-            error!(target: "signal-handler",
-                   "error sending shutdown notification: {}",
-                   err);
-        }
-    }
-
-    unsafe {
-        #[allow(static_mut_refs)]
-        SHUTDOWN_NOTIFY.write(Notify::new());
-    }
-
-    match unsafe { signal(SIGTERM, handler as *const() as sighandler_t) } {
-        0 => Ok(()),
-        err => {
-            report_signal_error(err);
-
-            Err(RegisterSignalsError)
-        }
-    }?;
-
-    match unsafe { signal(SIGINT, handler as *const() as sighandler_t) } {
-        0 => Ok(()),
-        err => {
-            report_signal_error(err);
-
-            Err(RegisterSignalsError)
-        }
-    }?;
-
-    if sighup {
-        match unsafe { signal(SIGHUP, handler as *const() as sighandler_t) } {
-            0 => Ok(()),
-            err => {
-                report_signal_error(err);
-
-                Err(RegisterSignalsError)
-            }
-        }?;
-    }
-
-    unsafe {
-        #[allow(static_mut_refs)]
-        let notify = SHUTDOWN_NOTIFY.assume_init_mut();
-
-        match notify.register() {
-            Ok(idx) => Ok((notify, idx)),
-            Err(err) => {
-                error!(target: "standalone",
-                       "error registering notify: {}",
-                       err);
-
-                Err(RegisterSignalsError)
-            }
-        }
-    }
+struct ServiceArgs {
+    /// Path to pidfile.
+    pidfile: PathBuf,
+    /// Run directory.
+    rundir: PathBuf,
+    user: Option<String>,
+    group: Option<String>,
+    daemon: bool
 }
 
-fn app_shutdown_signals(
-    sighup: bool
-) -> Result<ShutdownFlag, RegisterSignalsError> {
-    static mut SHUTDOWN: MaybeUninit<ShutdownFlag> = MaybeUninit::uninit();
+struct RegisterSignalsError;
+
+struct LockFreeList {
+    flag: ShutdownFlag,
+    next: *mut LockFreeList
+}
+
+static SHUTDOWN_FLAGS: AtomicPtr<LockFreeList> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+/// Register a shutdown flag, which will be raised when a termination
+/// signal is received.
+pub fn register_shutdown(flag: ShutdownFlag) {
+    let new = Box::into_raw(Box::new(LockFreeList {
+        flag: flag,
+        next: std::ptr::null_mut()
+    }));
+
+    while {
+        let curr = SHUTDOWN_FLAGS.load(Ordering::Relaxed);
+
+        unsafe {
+            (*new).next = curr;
+        }
+
+        SHUTDOWN_FLAGS
+            .compare_exchange_weak(
+                curr,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed
+            )
+            .is_err()
+    } {}
+}
+
+fn shutdown_signals(sighup: bool) -> Result<(), RegisterSignalsError> {
     static mut SHUTDOWN_ON_INT: bool = false;
 
     unsafe extern "C" fn handler(sig: c_int) {
@@ -488,16 +513,22 @@ fn app_shutdown_signals(
             }
         }
 
-        #[allow(static_mut_refs)]
-        SHUTDOWN.assume_init_mut().set();
+        let mut curr = SHUTDOWN_FLAGS.load(Ordering::Acquire);
+
+        while !curr.is_null() {
+            unsafe {
+                if let Err(err) = (*curr).flag.set() {
+                    error!(target: "signal-handler",
+                           "error sending shutdown notification: {}",
+                           err);
+                }
+
+                curr = (*curr).next;
+            }
+        }
     }
 
-    unsafe {
-        #[allow(static_mut_refs)]
-        SHUTDOWN.write(ShutdownFlag::new());
-    }
-
-    match unsafe { signal(SIGTERM, handler as *const() as sighandler_t) } {
+    match unsafe { signal(SIGTERM, handler as *const () as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -506,7 +537,7 @@ fn app_shutdown_signals(
         }
     }?;
 
-    match unsafe { signal(SIGINT, handler as *const() as sighandler_t) } {
+    match unsafe { signal(SIGINT, handler as *const () as sighandler_t) } {
         0 => Ok(()),
         err => {
             report_signal_error(err);
@@ -516,7 +547,7 @@ fn app_shutdown_signals(
     }?;
 
     if sighup {
-        match unsafe { signal(SIGHUP, handler as *const() as sighandler_t) } {
+        match unsafe { signal(SIGHUP, handler as *const () as sighandler_t) } {
             0 => Ok(()),
             err => {
                 report_signal_error(err);
@@ -526,10 +557,7 @@ fn app_shutdown_signals(
         }?;
     }
 
-    unsafe {
-        #[allow(static_mut_refs)]
-        Ok(SHUTDOWN.assume_init_mut().clone())
-    }
+    Ok(())
 }
 
 fn report_signal_error(err: usize) {
@@ -584,6 +612,108 @@ fn bootstrap_log_setup(loglvl: LevelFilter) -> Handle {
     handle
 }
 
+fn get_service_args<S: StandaloneService>(
+    args: &mut ArgMatches
+) -> Result<ServiceArgs, String> {
+    let component_confdir_env_name =
+        format!("CONSTELLATION_{}_RUNDIR", S::NAME.to_uppercase());
+    let component_rundir_env = match std::env::var(&component_confdir_env_name)
+    {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            component_confdir_env_name
+        ))
+    }?;
+    let rundir_env = match std::env::var(S::RUN_DIR_ENV) {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            S::RUN_DIR_ENV
+        ))
+    }?;
+    let rundir = args
+        .remove_one("rundir")
+        .or(component_rundir_env)
+        .or(rundir_env)
+        .unwrap_or(String::from(S::DEFAULT_RUN_DIR));
+    let component_pidfile_env_name =
+        format!("CONSTELLATION_{}_PIDFILE", S::NAME.to_uppercase());
+    let component_pidfile_env = match std::env::var(&component_pidfile_env_name)
+    {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            component_pidfile_env_name
+        ))
+    }?;
+    let default_pidfile = format!("{}/{}", rundir, S::DEFAULT_PIDFILE);
+    let rundir = PathBuf::from(rundir);
+    let pidfile = args
+        .remove_one("pidfile")
+        .or(component_pidfile_env)
+        .unwrap_or(default_pidfile);
+    let pidfile = PathBuf::from(pidfile);
+    let daemon = args.remove_one("daemon").unwrap_or(false);
+    let component_user_env_name =
+        format!("CONSTELLATION_{}_USER", S::NAME.to_uppercase());
+    let component_user_env = match std::env::var(&component_user_env_name) {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            component_confdir_env_name
+        ))
+    }?;
+    let user_env = match std::env::var(S::USER_ENV) {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            S::USER_ENV
+        ))
+    }?;
+    let user = args
+        .remove_one("user")
+        .or(component_user_env)
+        .or(user_env)
+        .or_else(|| S::DEFAULT_USER.map(String::from));
+    let component_group_env_name =
+        format!("CONSTELLATION_{}_GROUP", S::NAME.to_uppercase());
+    let component_group_env = match std::env::var(&component_group_env_name) {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            component_confdir_env_name
+        ))
+    }?;
+    let group_env = match std::env::var(S::GROUP_ENV) {
+        Ok(val) => Ok(Some(val)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!(
+            "Invalid unicode in environment variable {}",
+            S::GROUP_ENV
+        ))
+    }?;
+    let group = args
+        .remove_one("group")
+        .or(component_group_env)
+        .or(group_env)
+        .or_else(|| S::DEFAULT_GROUP.map(String::from));
+
+    Ok(ServiceArgs {
+        pidfile: pidfile,
+        rundir: rundir,
+        daemon: daemon,
+        user: user,
+        group: group
+    })
+}
+
 fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
     let component_confdir_env_name =
         format!("CONSTELLATION_{}_CONFDIR", S::NAME.to_uppercase());
@@ -596,12 +726,12 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
             component_confdir_env_name
         ))
     }?;
-    let confdir_env = match std::env::var(CONFDIR_ENV_NAME) {
+    let confdir_env = match std::env::var(S::CONFIG_DIR_ENV) {
         Ok(val) => Ok(Some(val)),
         Err(VarError::NotPresent) => Ok(None),
         Err(VarError::NotUnicode(_)) => Err(format!(
             "Invalid unicode in environment variable {}",
-            CONFDIR_ENV_NAME
+            S::CONFIG_DIR_ENV
         ))
     }?;
     let confdir = args
@@ -609,24 +739,6 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
         .or(component_confdir_env)
         .or(confdir_env)
         .map(PathBuf::from);
-    // let component_pidfile_env_name = format!(
-    // "CONSTELLATION_{}_PIDFILE",
-    // S::NAME.to_uppercase()
-    // );
-    // let component_pidfile_env =
-    // match std::env::var(&component_pidfile_env_name) {
-    // Ok(val) => Ok(Some(val)),
-    // Err(VarError::NotPresent) => Ok(None),
-    // Err(VarError::NotUnicode(_)) => {
-    // Err(format!(
-    // "Invalid unicode in environment variable {}",
-    // component_pidfile_env_name
-    // ))
-    // }
-    // }?;
-    // let pidfile = args.remove_one("pidfile")
-    // .or(component_pidfile_env)
-    // .map(PathBuf::from);
     let verbose = args.get_count("verbosity");
     let verbose_lvl: LevelFilter = match verbose {
         0 => Ok(LevelFilter::Warn),
@@ -657,7 +769,7 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
             component_loglvl_env_name
         ))
     }?;
-    let loglvl_env = match std::env::var(LOGLVL_ENV_NAME) {
+    let loglvl_env = match std::env::var(S::LOGLVL_ENV) {
         Ok(val) => {
             if verbose == 0 {
                 Ok(Some(val))
@@ -667,14 +779,14 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
                         "Cannot use verbose flag when setting ",
                         "log level through environment variable {}"
                     ),
-                    LOGLVL_ENV_NAME
+                    S::LOGLVL_ENV
                 ))
             }
         }
         Err(VarError::NotPresent) => Ok(None),
         Err(VarError::NotUnicode(_)) => Err(format!(
             "Invalid unicode in environment variable {}",
-            LOGLVL_ENV_NAME
+            S::LOGLVL_ENV
         ))
     }?;
     let loglvl = match args.remove_one("loglvl") {
@@ -698,21 +810,52 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
     })
 }
 
+fn service_cmdargs<S: Standalone>() -> Command {
+    cmdargs_setup::<S>()
+        .arg(
+            Arg::new("rundir")
+                .short('r')
+                .long("rundir")
+                .help("Run directory")
+        )
+        .arg(
+            Arg::new("daemon")
+                .short('d')
+                .long("daemon")
+                .action(ArgAction::SetTrue)
+                .help("Run as a daemon")
+        )
+        .arg(
+            Arg::new("pidfile")
+                .long("pidfile")
+                .requires("daemon")
+                .help("Location of PID file")
+        )
+        .arg(
+            Arg::new("user")
+                .short('u')
+                .long("user")
+                .requires("daemon")
+                .help("User to run as")
+        )
+        .arg(
+            Arg::new("group")
+                .short('g')
+                .long("group")
+                .requires("daemon")
+                .help("Group to run as")
+        )
+}
+
 /// Set up command-line argument parser.
 fn cmdargs_setup<S: Standalone>() -> Command {
-    let cmd = command!()
+    command!()
         .version(S::VERSION.to_string())
         .arg(
             Arg::new("confdir")
                 .short('c')
                 .long("confdir")
                 .help("Location of configuration files")
-        )
-        .arg(
-            Arg::new("daemon")
-                .short('d')
-                .long("daemon")
-                .help("Run as a daemon")
         )
         .arg(
             Arg::new("loglvl")
@@ -722,19 +865,12 @@ fn cmdargs_setup<S: Standalone>() -> Command {
                 .help("Set logging level")
         )
         .arg(
-            Arg::new("pidfile")
-                .long("pidfile")
-                .help("Location of PID file")
-        )
-        .arg(
             Arg::new("verbosity")
                 .short('v')
                 .long("verbose")
                 .help("Increase logging verbosity")
                 .action(ArgAction::Count)
-        );
-
-    S::cmdargs(cmd)
+        )
 }
 
 /// Get the set of configuration directories to search for
