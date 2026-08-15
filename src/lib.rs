@@ -312,12 +312,10 @@ pub trait StandaloneService: Standalone {
             }
 
             // Delete the pidfile if we're a daemon.
-            if daemon {
-                if let Err(err) = std::fs::remove_file(pidfile) {
-                    error!("failed to remove pid file: {}", err);
+            if daemon && let Err(err) = std::fs::remove_file(pidfile) {
+                error!("failed to remove pid file: {}", err);
 
-                    std::process::exit(1);
-                }
+                std::process::exit(1);
             }
         } else {
             error!("could not obtain valid configuration");
@@ -506,10 +504,12 @@ fn shutdown_signals(sighup: bool) -> Result<(), RegisterSignalsError> {
 
     unsafe extern "C" fn handler(sig: c_int) {
         if sig == SIGINT {
-            if SHUTDOWN_ON_INT {
-                exit(1);
-            } else {
-                SHUTDOWN_ON_INT = true
+            unsafe {
+                if SHUTDOWN_ON_INT {
+                    exit(1);
+                } else {
+                    SHUTDOWN_ON_INT = true
+                }
             }
         }
 
