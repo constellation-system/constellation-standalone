@@ -32,11 +32,10 @@
 use std::env::VarError;
 use std::ffi::CString;
 use std::fs::File;
+use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
-use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::Ordering;
 
 use clap::Arg;
 use clap::ArgAction;
@@ -124,6 +123,11 @@ pub trait Standalone: Sized {
     /// Version string for this application.
     const VERSION: FullVersion;
 
+    /// Size hint for the number of wakers that will be registered.
+    ///
+    /// Defaults to `None`.
+    const NWAKERS: Option<usize> = None;
+
     /// Type of configuration objects.
     type Config: for<'de> Deserialize<'de>;
 
@@ -138,7 +142,9 @@ pub trait Standalone: Sized {
     /// Create an instance of the component from a configuration.
     fn create(
         args: ArgMatches,
-        config: Self::Config
+        config: Self::Config,
+        // XXX this shouldn't be here
+        shutdown: &ShutdownFlag
     ) -> Result<(Self, Self::CreateCleanup), Self::CreateCleanup>;
 }
 
@@ -184,7 +190,8 @@ pub trait StandaloneService: Standalone {
     /// Entrypoint for the component.
     fn run(
         self,
-        rundir: PathBuf
+        rundir: PathBuf,
+        shutdown_flag: ShutdownFlag
     ) -> Result<Self::RunCleanup, Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
@@ -192,7 +199,7 @@ pub trait StandaloneService: Standalone {
     /// The two cleanup objects `create` and `run` are the same that
     /// are returned by [create](Standalone::create) and
     /// [run](Standalone::run).
-    fn shutdown(
+    fn join(
         create: Self::CreateCleanup,
         run: Option<Self::RunCleanup>
     );
@@ -272,42 +279,35 @@ pub trait StandaloneService: Standalone {
                 }
             }
 
-            match Self::create(arg_matches, config) {
-                Ok((app, create_cleanup)) => {
-                    // Register signal handlers and start the service.
-                    if shutdown_signals(true).is_ok() {
-                        match app.run(rundir) {
-                            Ok(run_cleanup) => {
-                                Self::shutdown(
-                                    create_cleanup,
-                                    Some(run_cleanup)
-                                );
+            // Register signal handlers and start the service.
+            if let Ok(flag) = shutdown_signals(true, Self::NWAKERS) {
+                match Self::create(arg_matches, config, &flag) {
+                    Ok((app, create_cleanup)) => match app.run(rundir, flag) {
+                        Ok(run_cleanup) => {
+                            Self::join(create_cleanup, Some(run_cleanup));
 
-                                info!(target: "standalone",
-                                      "{} shutdown successful",
-                                      Self::NAME);
-                            }
-                            Err(err) => {
-                                Self::shutdown_err(create_cleanup, err);
-
-                                std::process::exit(1);
-                            }
+                            info!(target: "standalone",
+                                  "{} shutdown successful",
+                                  Self::NAME);
                         }
-                    } else {
-                        Self::shutdown(create_cleanup, None);
+                        Err(err) => {
+                            Self::shutdown_err(create_cleanup, err);
+
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(cleanup) => {
+                        debug!(target: "standalone",
+                               "cleaning up after create error");
+
+                        Self::join(cleanup, None);
+
+                        info!(target: "standalone",
+                              "{} cleaned up after error",
+                              Self::NAME);
+
+                        std::process::exit(1);
                     }
-                }
-                Err(cleanup) => {
-                    debug!(target: "standalone",
-                           "cleaning up after create error");
-
-                    Self::shutdown(cleanup, None);
-
-                    info!(target: "standalone",
-                          "{} cleaned up after error",
-                          Self::NAME);
-
-                    std::process::exit(1);
                 }
             }
 
@@ -353,7 +353,10 @@ pub trait StandaloneApp: Standalone {
     type RunErrorCleanup;
 
     /// Entrypoint for the component.
-    fn run(self) -> Result<(), Self::RunErrorCleanup>;
+    fn run(
+        self,
+        shutdown_flag: ShutdownFlag
+    ) -> Result<(), Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
     ///
@@ -402,35 +405,31 @@ pub trait StandaloneApp: Standalone {
         log_setup::<Self>(&dirs, &handle);
 
         if let Some(config) = load_config::<Self>(&dirs) {
-            match Self::create(arg_matches, config) {
-                Ok((app, create_cleanup)) => {
-                    // Register signal handlers and start the service.
-                    if shutdown_signals(true).is_ok() {
-                        match app.run() {
-                            Ok(()) => {
-                                Self::cleanup(create_cleanup);
-                            }
-                            Err(err) => {
-                                Self::cleanup_err(create_cleanup, err);
-
-                                std::process::exit(1);
-                            }
+            // Register signal handlers and start the service.
+            if let Ok(flag) = shutdown_signals(true, Self::NWAKERS) {
+                match Self::create(arg_matches, config, &flag) {
+                    Ok((app, create_cleanup)) => match app.run(flag) {
+                        Ok(()) => {
+                            Self::cleanup(create_cleanup);
                         }
-                    } else {
-                        Self::cleanup(create_cleanup);
+                        Err(err) => {
+                            Self::cleanup_err(create_cleanup, err);
+
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(cleanup) => {
+                        debug!(target: "standalone",
+                               "cleaning up after create error");
+
+                        Self::cleanup(cleanup);
+
+                        info!(target: "standalone",
+                              "{} cleaned up after error",
+                              Self::NAME);
+
+                        std::process::exit(1);
                     }
-                }
-                Err(cleanup) => {
-                    debug!(target: "standalone",
-                           "cleaning up after create error");
-
-                    Self::cleanup(cleanup);
-
-                    info!(target: "standalone",
-                          "{} cleaned up after error",
-                          Self::NAME);
-
-                    std::process::exit(1);
                 }
             }
         } else {
@@ -465,42 +464,17 @@ struct ServiceArgs {
 
 struct RegisterSignalsError;
 
-struct LockFreeList {
-    flag: ShutdownFlag,
-    next: *mut LockFreeList
-}
-
-static SHUTDOWN_FLAGS: AtomicPtr<LockFreeList> =
-    AtomicPtr::new(std::ptr::null_mut());
-
-/// Register a shutdown flag, which will be raised when a termination
-/// signal is received.
-pub fn register_shutdown(flag: ShutdownFlag) {
-    let new = Box::into_raw(Box::new(LockFreeList {
-        flag: flag,
-        next: std::ptr::null_mut()
-    }));
-
-    while {
-        let curr = SHUTDOWN_FLAGS.load(Ordering::Relaxed);
-
-        unsafe {
-            (*new).next = curr;
-        }
-
-        SHUTDOWN_FLAGS
-            .compare_exchange_weak(
-                curr,
-                new,
-                Ordering::AcqRel,
-                Ordering::Relaxed
-            )
-            .is_err()
-    } {}
-}
-
-fn shutdown_signals(sighup: bool) -> Result<(), RegisterSignalsError> {
+fn shutdown_signals(
+    sighup: bool,
+    size: Option<usize>
+) -> Result<ShutdownFlag, RegisterSignalsError> {
+    static mut SHUTDOWN_FLAG: MaybeUninit<ShutdownFlag> = MaybeUninit::uninit();
     static mut SHUTDOWN_ON_INT: bool = false;
+
+    let flag = match size {
+        Some(size) => ShutdownFlag::with_capacity(size),
+        None => ShutdownFlag::new()
+    };
 
     unsafe extern "C" fn handler(sig: c_int) {
         if sig == SIGINT {
@@ -513,19 +487,19 @@ fn shutdown_signals(sighup: bool) -> Result<(), RegisterSignalsError> {
             }
         }
 
-        let mut curr = SHUTDOWN_FLAGS.load(Ordering::Acquire);
-
-        while !curr.is_null() {
-            unsafe {
-                if let Err(err) = (*curr).flag.set() {
-                    error!(target: "signal-handler",
-                           "error sending shutdown notification: {}",
-                           err);
-                }
-
-                curr = (*curr).next;
+        #[allow(static_mut_refs)]
+        unsafe {
+            if let Err(err) = SHUTDOWN_FLAG.assume_init_mut().set() {
+                error!(target: "signal-handler",
+                       "error sending shutdown notification: {}",
+                       err);
             }
         }
+    }
+
+    unsafe {
+        #[allow(static_mut_refs)]
+        SHUTDOWN_FLAG.write(flag.clone());
     }
 
     match unsafe { signal(SIGTERM, handler as *const () as sighandler_t) } {
@@ -557,7 +531,7 @@ fn shutdown_signals(sighup: bool) -> Result<(), RegisterSignalsError> {
         }?;
     }
 
-    Ok(())
+    Ok(flag)
 }
 
 fn report_signal_error(err: usize) {
@@ -811,66 +785,51 @@ fn get_args<S: Standalone>(args: &mut ArgMatches) -> Result<Args, String> {
 }
 
 fn service_cmdargs<S: Standalone>() -> Command {
-    cmdargs_setup::<S>()
-        .arg(
-            Arg::new("rundir")
-                .short('r')
-                .long("rundir")
-                .help("Run directory")
-        )
-        .arg(
-            Arg::new("daemon")
-                .short('d')
-                .long("daemon")
-                .action(ArgAction::SetTrue)
-                .help("Run as a daemon")
-        )
-        .arg(
-            Arg::new("pidfile")
-                .long("pidfile")
-                .requires("daemon")
-                .help("Location of PID file")
-        )
-        .arg(
-            Arg::new("user")
-                .short('u')
-                .long("user")
-                .requires("daemon")
-                .help("User to run as")
-        )
-        .arg(
-            Arg::new("group")
-                .short('g')
-                .long("group")
-                .requires("daemon")
-                .help("Group to run as")
-        )
+    cmdargs_setup::<S>().args([
+        Arg::new("rundir")
+            .short('r')
+            .long("rundir")
+            .help("Run directory"),
+        Arg::new("daemon")
+            .short('d')
+            .long("daemon")
+            .action(ArgAction::SetTrue)
+            .help("Run as a daemon"),
+        Arg::new("pidfile")
+            .long("pidfile")
+            .requires("daemon")
+            .help("Location of PID file"),
+        Arg::new("user")
+            .short('u')
+            .long("user")
+            .requires("daemon")
+            .help("User to run as"),
+        Arg::new("group")
+            .short('g')
+            .long("group")
+            .requires("daemon")
+            .help("Group to run as")
+    ])
 }
 
 /// Set up command-line argument parser.
 fn cmdargs_setup<S: Standalone>() -> Command {
-    command!()
-        .version(S::VERSION.to_string())
-        .arg(
-            Arg::new("confdir")
-                .short('c')
-                .long("confdir")
-                .help("Location of configuration files")
-        )
-        .arg(
-            Arg::new("loglvl")
-                .short('l')
-                .long("loglvl")
-                .value_parser(["error", "warn", "info", "debug", "trace"])
-                .help("Set logging level")
-        )
-        .arg(
-            Arg::new("verbosity")
-                .short('v')
-                .long("verbose")
-                .help("Increase logging verbosity")
-                .action(ArgAction::Count)
-        )
+    command!().version(S::VERSION.to_string()).args([
+        Arg::new("confdir")
+            .short('c')
+            .long("confdir")
+            .help("Location of configuration files"),
+        Arg::new("loglvl")
+            .short('l')
+            .long("loglvl")
+            .value_parser(["error", "warn", "info", "debug", "trace"])
+            .help("Set logging level"),
+        Arg::new("verbosity")
+            .short('v')
+            .long("verbose")
+            .help("Increase logging verbosity")
+            .action(ArgAction::Count)
+    ])
 }
 
 /// Get the set of configuration directories to search for
