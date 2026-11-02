@@ -134,10 +134,15 @@ pub trait Standalone: Sized {
     /// Type of cleanup objects from [run](Standalone::create).
     type CreateCleanup;
 
+    /// Type of cleanup objects from [run](Standalone::create).
+    type CreateErrorCleanup;
+
     /// Add command-line arguments to be parsed.
     fn cmdargs(cmd: Command) -> Command {
         cmd
     }
+
+    fn cleanup_create_err(create: Self::CreateErrorCleanup);
 
     /// Create an instance of the component from a configuration.
     fn create(
@@ -145,7 +150,7 @@ pub trait Standalone: Sized {
         config: Self::Config,
         // XXX this shouldn't be here
         shutdown: &ShutdownFlag
-    ) -> Result<(Self, Self::CreateCleanup), Self::CreateCleanup>;
+    ) -> Result<(Self, Self::CreateCleanup), Self::CreateErrorCleanup>;
 }
 
 /// Trait for standalone services.
@@ -201,7 +206,7 @@ pub trait StandaloneService: Standalone {
     /// [run](Standalone::run).
     fn join(
         create: Self::CreateCleanup,
-        run: Option<Self::RunCleanup>
+        run: Self::RunCleanup
     );
 
     /// Shut down the component and clean up any resources in the
@@ -284,7 +289,7 @@ pub trait StandaloneService: Standalone {
                 match Self::create(arg_matches, config, &flag) {
                     Ok((app, create_cleanup)) => match app.run(rundir, flag) {
                         Ok(run_cleanup) => {
-                            Self::join(create_cleanup, Some(run_cleanup));
+                            Self::join(create_cleanup, run_cleanup);
 
                             info!(target: "standalone",
                                   "{} shutdown successful",
@@ -300,7 +305,7 @@ pub trait StandaloneService: Standalone {
                         debug!(target: "standalone",
                                "cleaning up after create error");
 
-                        Self::join(cleanup, None);
+                        Self::cleanup_create_err(cleanup);
 
                         info!(target: "standalone",
                               "{} cleaned up after error",
@@ -422,7 +427,7 @@ pub trait StandaloneApp: Standalone {
                         debug!(target: "standalone",
                                "cleaning up after create error");
 
-                        Self::cleanup(cleanup);
+                        Self::cleanup_create_err(cleanup);
 
                         info!(target: "standalone",
                               "{} cleaned up after error",
