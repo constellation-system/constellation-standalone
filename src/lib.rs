@@ -21,13 +21,22 @@
 //! Common support for running Constellation components as standalone
 //! executables.
 //!
-//! This package provides the [Standalone] trait, which can be
-//! implemented by Constellation components in order to allow them to
-//! be easily turned into standalone executables.  This trait provides
-//! a common [main](Standalone::main) function which can be called
-//! from a one-line top-level `main`.  It handles reading in
-//! configurations, setting up logging, and other tasks in a common
-//! manner.
+//! This package provides the [`Standalone`] trait and its two
+//! subtraits, which can be implemented by Constellation components in
+//! order to allow them to be easily turned into standalone
+//! executables.  This provides common functionality for starting up,
+//! setting up logging, loading config files, handling command-line
+//! arguments, handling signals, shutting down, and other tasks.
+//!
+//! The [`StandaloneService`] subtrait is for components that can be
+//! run as system services.  This trait provides a common
+//! [`main`](StandaloneService::main) function which can be called
+//! from a one-line top-level `main`.  It permits components to be run
+//! as daemons using the [`daemonize`] crate.
+//!
+//! The [`StandaloneApp`] subtrait is for components that are run as
+//! command-line utilities that perform an action, then exit.  It also
+//! provides a common [`main`](StandaloneApp::main).
 
 use std::env::VarError;
 use std::ffi::CString;
@@ -79,8 +88,8 @@ const DEFAULT_GROUP: &str = "constellation";
 
 /// Base trait for standalone components.
 ///
-/// This trait defines a common interface used by [StandaloneService]
-/// and [StandaloneApp] to manage the following tasks:
+/// This trait defines a common interface used by [`StandaloneService`]
+/// and [`StandaloneApp`] to manage the following tasks:
 ///
 /// * Identifying the location of configuration files, and reading them in.
 ///
@@ -91,18 +100,36 @@ const DEFAULT_GROUP: &str = "constellation";
 /// * Setting up and running the component.
 ///
 /// * Cleanly shutting down.
+///
+/// Standalone components should implement this trait and one of its
+/// two subtraits, [`StandaloneService`] or [`StandaloneApp`]
 pub trait Standalone: Sized {
+    /// Environment variable name for the log level.
+    ///
+    /// This defines the name of an environment variable that will set
+    /// the log level, if it has not been set by a command-line
+    /// argument.
+    ///
+    /// This defaults to `CONSTELLATION_LOGLVL`.
     const LOGLVL_ENV: &str = DEFAULT_LOGLVL_ENV_NAME;
+
+    /// Environment variable name for the configuration directory.
+    ///
+    /// This defines the name of an environment variable that will set
+    /// the configuration directory, if it has not been set by a
+    /// command-line argument.
+    ///
+    /// This defaults to `CONSTELLATION_CONFDIR`.
     const CONFIG_DIR_ENV: &str = DEFAULT_CONFDIR_ENV_NAME;
 
     /// Location of the system-wide configuration directory.
     ///
-    /// Defaults to `/usr/local/etc/constellation`.
+    /// This defaults to `/usr/local/etc/constellation`.
     const SYSTEM_CONFIG_DIR: &str = DEFAULT_SYSTEM_CONFDIR;
 
     /// Subdirectory under which home directory configurations are stored.
     ///
-    /// Defaults to `.config/constellation`.
+    /// This defaults to `.config/constellation`.
     const HOME_CONFIG_SUBDIR: &str = DEFAULT_HOME_CONFSUBDIR;
 
     /// Name of the standalone component.
@@ -117,7 +144,7 @@ pub trait Standalone: Sized {
     ///
     /// These are given in order of preference.
     ///
-    /// Defaults to a single entry, `constellation-log.yaml`.
+    /// This defaults to a single entry, `constellation-log.yaml`.
     const LOG_CONFIG_FILES: &[&str] = &["constellation-log.yaml"];
 
     /// Version string for this application.
@@ -131,20 +158,60 @@ pub trait Standalone: Sized {
     /// Type of configuration objects.
     type Config: for<'de> Deserialize<'de>;
 
-    /// Type of cleanup objects from [run](Standalone::create).
+    /// Type of cleanup objects from [`run`](Standalone::create).
+    ///
+    /// This should contain all information needed to clean up after a
+    /// successful [`create`](Standalone::create).
     type CreateCleanup;
 
-    /// Type of cleanup objects from [run](Standalone::create).
+    /// Type of cleanup objects from [`run`](Standalone::create).
+    ///
+    /// This should contain all information needed to clean up after a
+    /// [`create`](Standalone::create) that failed with an error.
     type CreateErrorCleanup;
 
     /// Add command-line arguments to be parsed.
+    ///
+    /// This should add whatever command-line arguments are needed for
+    /// the application to `cmd`, then return the resulting
+    /// [`Command`].
+    ///
+    /// The default behavior is to do nothing.
+    ///
+    /// # Parameters
+    ///
+    /// - `cmd`: [`Command`] to which to add arguments.
+    ///
+    /// # Return Value
+    ///
+    /// The `cmd` parameter with new arguments added.
     fn cmdargs(cmd: Command) -> Command {
         cmd
     }
 
+    /// Clean up after an errored [`create`](Standalone::create).
+    ///
+    /// This should clean up after a [`create`](Standalone::create)
+    /// that failed with an error.
+    ///
+    /// # Parameters
+    ///
+    /// - `create`: The error generated by the failed
+    ///   [`create`](Standalone::create)
     fn cleanup_create_err(create: Self::CreateErrorCleanup);
 
     /// Create an instance of the component from a configuration.
+    ///
+    /// This should create the `Standalone` instance, but not start
+    /// any threads yet.
+    ///
+    /// # Parameters
+    ///
+    /// - `args`: The command-line arguments.
+    ///
+    /// - `config`: Configuration that was loaded.
+    ///
+    /// - `shutdown`: The [`ShutdownFlag`] to use for shutdown signalling.
     fn create(
         args: ArgMatches,
         config: Self::Config,
@@ -155,9 +222,9 @@ pub trait Standalone: Sized {
 
 /// Trait for standalone services.
 ///
-/// This provides a [main](Standalone::main) function that can be
-/// called directly from the top-level `main`.  It also manages the
-/// following tasks:
+/// This provides a [`main`](StandaloneService::main) function that
+/// can be called directly from the top-level `main`.  It also manages
+/// the following tasks:
 ///
 /// * Identifying the location of configuration files, and reading them in.
 ///
@@ -176,34 +243,95 @@ pub trait Standalone: Sized {
 /// the necessary definitions for the configuration types, how to
 /// initialize the component, how to run it, and how to shut it down.
 ///
-/// The `main` function should then simply call [Standalone::main].
+/// The `main` function should then simply call [`StandaloneService::main`].
 pub trait StandaloneService: Standalone {
+    /// Environment variable name for the run directory.
+    ///
+    /// This defines the name of an environment variable that will set
+    /// the run directory, if it has not been set by a
+    /// command-line argument.
+    ///
+    /// This defaults to `CONSTELLATION_RUNDIR`.
     const RUN_DIR_ENV: &str = DEFAULT_RUNDIR_ENV_NAME;
+
+    /// Environment variable name for the user.
+    ///
+    /// This defines the name of an environment variable that will set
+    /// the user, if it has not been set by a command-line argument.
+    ///
+    /// This defaults to `CONSTELLATION_USER`.
     const USER_ENV: &str = DEFAULT_USER_ENV_NAME;
+
+    /// Environment variable name for the group.
+    ///
+    /// This defines the name of an environment variable that will set
+    /// the group, if it has not been set by a command-line argument.
+    ///
+    /// This defaults to `CONSTELLATION_GROUP`.
     const GROUP_ENV: &str = DEFAULT_GROUP_ENV_NAME;
+
+    /// Default run directory.
+    ///
+    /// This defaults to `/var/run/constellation/`.
     const DEFAULT_RUN_DIR: &str = DEFAULT_RUNDIR;
+
+    /// Default user.
+    ///
+    /// This defaults to `constellation`.
     const DEFAULT_USER: Option<&str> = Some(DEFAULT_USER);
+
+    /// Default user.
+    ///
+    /// This defaults to `constellation`.
     const DEFAULT_GROUP: Option<&str> = Some(DEFAULT_GROUP);
+
+    /// Default group.
+    ///
+    /// This defaults to `constellation`.
     const DEFAULT_PIDFILE: &str;
 
-    /// Type of cleanup objects from [run](Standalone::run).
+    /// Type of cleanup objects from [`run`](StandaloneService::run).
+    ///
+    /// This should contain all information needed to clean up after a
+    /// successful [`run`](StandaloneService::run).  This will
+    /// typically contain [`JoinHandle`](std::thread::JoinHandle)s for
+    /// all threads.
     type RunCleanup;
 
-    /// Type of cleanup objects produced from errors in [run](Standalone::run).
+    /// Type of cleanup objects produced from errors in
+    /// [`run`](StandaloneService::run).
+    ///
+    /// This should contain all information needed to clean up after a
+    /// [`run`](StandaloneService::run) that failed with an error.
+    /// This will typically contain
+    /// [`JoinHandle`](std::thread::JoinHandle)s for all threads that
+    /// were started.
     type RunErrorCleanup;
 
-    /// Entrypoint for the component.
+    /// Entry-point for the component.
+    ///
+    /// This should run the service, starting any threads, and return
+    /// the [`RunCleanup`](StandaloneService::RunCleanup) immediately.
+    /// It should *not* block execution, or use the calling thread for
+    /// anything.
+    ///
+    /// # Parameters
+    ///
+    /// - `rundir`: The run directory to use.
+    ///
+    /// - `shutdown`: The [`ShutdownFlag`] to use for signalling shutdown.  This
+    ///   can be set by the component itself.
     fn run(
         self,
         rundir: PathBuf,
-        shutdown_flag: ShutdownFlag
+        shutdown: ShutdownFlag
     ) -> Result<Self::RunCleanup, Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
     ///
     /// The two cleanup objects `create` and `run` are the same that
-    /// are returned by [create](Standalone::create) and
-    /// [run](Standalone::run).
+    /// are returned by [`create`](Standalone::create) and
+    /// [`run`](StandaloneService::run).
     fn join(
         create: Self::CreateCleanup,
         run: Self::RunCleanup
@@ -213,8 +341,8 @@ pub trait StandaloneService: Standalone {
     /// event of an error.
     ///
     /// The two cleanup objects `create` and `run` are the same that
-    /// are returned by [create](Standalone::create) and
-    /// [run](Standalone::run) (if it returned an error).
+    /// are returned by [`create`](Standalone::create) and
+    /// [`run`](StandaloneService::run) (if it returned an error).
     fn shutdown_err(
         create: Self::CreateCleanup,
         run: Self::RunErrorCleanup
@@ -329,9 +457,10 @@ pub trait StandaloneService: Standalone {
         }
     }
 }
+
 /// Trait for standalone applications.
 ///
-/// This provides a [main](Standalone::main) function that can be
+/// This provides a [`main`](StandaloneApp::main) function that can be
 /// called directly from the top-level `main`.  It also manages the
 /// following tasks:
 ///
@@ -352,30 +481,46 @@ pub trait StandaloneService: Standalone {
 /// the necessary definitions for the configuration types, how to
 /// initialize the component, how to run it, and how to shut it down.
 ///
-/// The `main` function should then simply call [Standalone::main].
+/// The `main` function should then simply call [`StandaloneApp::main`].
 pub trait StandaloneApp: Standalone {
-    /// Type of cleanup objects produced from errors in [run](Standalone::run).
+    /// Type of cleanup objects produced from errors in
+    /// [`run`](StandaloneApp::run).
+    ///
+    /// This should contain all information needed to clean up after a
+    /// [`run`](StandaloneApp::run) that failed with an error.
+    /// This will typically contain
+    /// [`JoinHandle`](std::thread::JoinHandle)s for all threads that
+    /// were started.
     type RunErrorCleanup;
 
     /// Entrypoint for the component.
+    ///
+    /// This *should* take over execution of the calling thread and
+    /// run until completion.
+    ///
+    /// # Parameters
+    ///
+    /// - `shutdown`: [`ShutdownFlag`] used to signal shutdown.  The
+    ///   `StandaloneApp` should not need to set this; it should just return
+    ///   from this function.
     fn run(
         self,
-        shutdown_flag: ShutdownFlag
+        shutdown: ShutdownFlag
     ) -> Result<(), Self::RunErrorCleanup>;
 
     /// Shut down the component and clean up any resources.
     ///
     /// The two cleanup objects `create` and `run` are the same that
-    /// are returned by [create](Standalone::create) and
-    /// [run](Standalone::run).
+    /// are returned by [`create`](Standalone::create) and
+    /// [`run`](StandaloneApp::run).
     fn cleanup(create: Self::CreateCleanup);
 
     /// Shut down the component and clean up any resources in the
     /// event of an error.
     ///
     /// The two cleanup objects `create` and `run` are the same that
-    /// are returned by [create](Standalone::create) and
-    /// [run](Standalone::run) (if it returned an error).
+    /// are returned by [`create`](Standalone::create) and
+    /// [`run`](StandaloneApp::run) (if it returned an error).
     fn cleanup_err(
         create: Self::CreateCleanup,
         run: Self::RunErrorCleanup
@@ -967,7 +1112,7 @@ fn load_config<S: Standalone>(dirs: &[PathBuf]) -> Option<S::Config> {
                        path.to_string_lossy());
 
                 match File::open(path.clone()) {
-                    Ok(file) => match serde_yaml::from_reader(file) {
+                    Ok(file) => match yaml_serde::from_reader(file) {
                         Ok(yaml) => {
                             trace!(target: "load-config",
                                    "found valid configuration");
